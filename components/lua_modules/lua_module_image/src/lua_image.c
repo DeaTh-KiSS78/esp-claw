@@ -17,6 +17,7 @@
 #include "esp_jpeg_dec.h"
 #include "esp_log.h"
 #include "lauxlib.h"
+#include "lua_image_resize.h"
 
 #define LUA_MODULE_IMAGE_NAME "image"
 #define LUA_IMAGE_FRAME_MT "image.frame"
@@ -686,6 +687,151 @@ static int lua_module_image_convert(lua_State *L)
     return lua_image_push_frame_view(L, source->store, format);
 }
 
+/* Pick the resize output format. Caller may pin it through opts.format;
+ * otherwise we mirror the source frame's logical channels (GRAY8 stays
+ * gray, everything else lifts to RGB565LE). */
+static lua_image_format_t lua_image_resize_pick_output(lua_image_format_t source_format,
+                                                       bool format_explicit,
+                                                       lua_image_format_t requested)
+{
+    if (format_explicit) {
+        return requested;
+    }
+    return source_format == LUA_IMAGE_FORMAT_GRAY8 ? LUA_IMAGE_FORMAT_GRAY8 : LUA_IMAGE_FORMAT_RGB565LE;
+}
+
+static bool lua_image_resize_parse_filter(const char *name, lua_image_resize_filter_t *out)
+{
+    if (name == NULL || strcmp(name, "nearest") == 0) {
+        *out = LUA_IMAGE_RESIZE_FILTER_NEAREST;
+        return true;
+    }
+    if (strcmp(name, "bilinear") == 0) {
+        *out = LUA_IMAGE_RESIZE_FILTER_BILINEAR;
+        return true;
+    }
+    return false;
+}
+
+/* image.resize(frame, opts)
+ * opts = { width, height, [format = image.RGB565|image.GRAY8], [filter = "nearest"|"bilinear"] }
+ * Returns a new image.frame backed by an independent store; the source frame
+ * and its cache are untouched (apart from the intermediate RGB565/GRAY8
+ * conversion that may have been needed to read the pixels). */
+static int lua_module_image_resize(lua_State *L)
+{
+    lua_image_frame_ud_t *source = lua_image_check_frame(L, 1);
+    int dst_width;
+    int dst_height;
+    lua_image_format_t requested_format = LUA_IMAGE_FORMAT_RGB565LE;
+    bool format_explicit = false;
+    const char *filter_name = NULL;
+    lua_image_resize_filter_t filter;
+    lua_image_format_t source_format;
+    lua_image_format_t output_format;
+    const lua_image_buffer_t *intermediate;
+    lua_image_source_t intermediate_src;
+    lua_image_view_t intermediate_view;
+    lua_image_view_t output_view = {0};
+    lua_image_frame_info_t info = {0};
+    const char *fourcc;
+    esp_err_t err;
+
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    if (source->closed || source->store == NULL || source->store->closed) {
+        return luaL_error(L, "image.resize source frame is released");
+    }
+    source_format = source->format;
+
+    lua_getfield(L, 2, "width");
+    dst_width = (int)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 2, "height");
+    dst_height = (int)luaL_checkinteger(L, -1);
+    lua_pop(L, 1);
+    if (dst_width <= 0 || dst_height <= 0) {
+        return luaL_error(L, "image.resize width/height must be positive");
+    }
+
+    lua_getfield(L, 2, "format");
+    if (!lua_isnil(L, -1)) {
+        lua_Integer fv = luaL_checkinteger(L, -1);
+        if (!lua_image_check_format_value(fv, &requested_format)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "image.resize invalid format constant: %d", (int)fv);
+        }
+        format_explicit = true;
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "filter");
+    if (!lua_isnil(L, -1)) {
+        filter_name = luaL_checkstring(L, -1);
+    }
+    if (!lua_image_resize_parse_filter(filter_name, &filter)) {
+        lua_pop(L, 1);
+        return luaL_error(L, "image.resize unsupported filter: %s", filter_name);
+    }
+    lua_pop(L, 1);
+
+    output_format = lua_image_resize_pick_output(source_format, format_explicit, requested_format);
+    if (output_format != LUA_IMAGE_FORMAT_RGB565LE && output_format != LUA_IMAGE_FORMAT_GRAY8) {
+        return luaL_error(L, "image.resize output format must be RGB565 or GRAY8, got %s",
+                          lua_image_format_name(output_format));
+    }
+
+    /* Lift the source into the canonical intermediate format, caching it
+     * inside the source store so future calls (including convert / resize)
+     * skip the decode step. */
+    err = lua_image_store_require_format(source->store, output_format);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.resize source conversion failed: %s", esp_err_to_name(err));
+    }
+    intermediate = lua_image_store_get_buffer(source->store, output_format);
+    if (intermediate == NULL || !intermediate->valid || intermediate->data == NULL) {
+        return luaL_error(L, "image.resize intermediate buffer missing after conversion");
+    }
+    err = lua_image_source_from_buffer(intermediate, output_format, &intermediate_src);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.resize intermediate buffer borrow failed");
+    }
+    intermediate_view.data = intermediate_src.data;
+    intermediate_view.bytes = intermediate_src.bytes;
+    intermediate_view.width = intermediate_src.width;
+    intermediate_view.height = intermediate_src.height;
+    intermediate_view.format = output_format;
+    intermediate_view.owned = false;
+    strlcpy(intermediate_view.source_format, intermediate_src.source_format, sizeof(intermediate_view.source_format));
+
+    err = lua_image_resize_view(&intermediate_view, dst_width, dst_height, filter, &output_view);
+    if (err != ESP_OK) {
+        return luaL_error(L, "image.resize failed: %s", esp_err_to_name(err));
+    }
+
+    fourcc = lua_image_format_fourcc(output_format);
+    if (fourcc == NULL) {
+        lua_image_release_view(&output_view);
+        return luaL_error(L, "image.resize internal format error");
+    }
+    info.width = output_view.width;
+    info.height = output_view.height;
+    info.bytes = output_view.bytes;
+    info.timestamp_us = intermediate->info.timestamp_us;
+    strlcpy(info.pixel_format, fourcc, sizeof(info.pixel_format));
+
+    err = lua_image_push_frame(L, output_view.data, output_view.bytes, &info, lua_image_free_owned_frame, NULL);
+    if (err != ESP_OK) {
+        lua_image_release_view(&output_view);
+        return luaL_error(L, "image.resize push frame failed: %s", esp_err_to_name(err));
+    }
+    /* Ownership transferred to the new frame's store; suppress release_view free. */
+    output_view.data = NULL;
+    output_view.bytes = 0;
+    output_view.owned = false;
+    return 1;
+}
+
 /* image.load_file(path)
  * Loads an image file into an owned image.frame. The frame owns the file buffer
  * and releases it when frame:release(), <close>, or __gc runs. */
@@ -822,6 +968,7 @@ int luaopen_image(lua_State *L)
 {
     static const luaL_Reg funcs[] = {
         {"convert", lua_module_image_convert},
+        {"resize", lua_module_image_resize},
         {"load_file", lua_module_image_load_file},
         {"save_file", lua_module_image_save_file},
         {NULL, NULL},

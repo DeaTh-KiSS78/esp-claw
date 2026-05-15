@@ -139,6 +139,47 @@ local run_ok, run_err = xpcall(function()
         assert_true(saved ~= nil and saved.size > 0, "saved JPEG should exist and be non-empty")
     end
 
+    -- image.resize: produces an independent frame, default output preserves
+    -- the source's logical channels (color -> RGB565, gray stays gray).
+    do
+        local frame <close> = image.load_file(INPUT_PATH)
+
+        local small <close> = image.resize(frame, { width = 32, height = 16 })
+        local small_info = small:info()
+        assert_true(small_info.valid == true, "resized frame should be valid")
+        assert_true(small_info.width == 32 and small_info.height == 16, "resize default size mismatch")
+        assert_true(small_info.pixel_format == "RGBP", "resize default output should be RGB565, got " .. tostring(small_info.pixel_format))
+        assert_true(small_info.bytes == 32 * 16 * 2, "resize RGB565 byte count mismatch: " .. tostring(small_info.bytes))
+
+        local gray <close> = image.resize(frame, { width = 20, height = 10, format = image.GRAY8, filter = "bilinear" })
+        local gray_info = gray:info()
+        assert_true(gray_info.pixel_format == "GREY", "resize GRAY8 format mismatch: " .. tostring(gray_info.pixel_format))
+        assert_true(gray_info.width == 20 and gray_info.height == 10, "resize GRAY8 size mismatch")
+        assert_true(gray_info.bytes == 20 * 10, "resize GRAY8 byte count mismatch: " .. tostring(gray_info.bytes))
+
+        -- Independent store: releasing the source must not invalidate resized frames.
+        frame:release()
+        assert_true(small:info().valid == true, "resized RGB565 should outlive source release")
+        assert_true(gray:info().valid == true, "resized GRAY8 should outlive source release")
+
+        -- Chained conversion on a resized frame uses the new frame's own cache.
+        local thumb_jpeg <close> = image.convert(small, image.JPEG)
+        local thumb_info = thumb_jpeg:info()
+        assert_true(thumb_info.pixel_format == "JPEG", "convert(small, JPEG) format mismatch")
+        assert_true(thumb_info.bytes > 0, "convert(small, JPEG) bytes should be > 0")
+    end
+
+    -- Reject unsupported output format and invalid dimensions.
+    do
+        local frame <close> = image.load_file(INPUT_PATH)
+        local bad_fmt = pcall(image.resize, frame, { width = 16, height = 16, format = image.YUYV })
+        assert_true(bad_fmt == false, "image.resize should reject non-RGB565/GRAY8 output")
+        local bad_dim = pcall(image.resize, frame, { width = 0, height = 16 })
+        assert_true(bad_dim == false, "image.resize should reject zero width")
+        local bad_filter = pcall(image.resize, frame, { width = 16, height = 16, filter = "bicubic" })
+        assert_true(bad_filter == false, "image.resize should reject unknown filter")
+    end
+
     local bad_load_ok = pcall(image.load_file, BAD_PATH)
     assert_true(bad_load_ok == false, "image.load_file should reject unsupported suffix")
 
