@@ -4,8 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <stdlib.h>
+#include <sys/cdefs.h>
+
 #include "esp_check.h"
 #include "esp_lcd_hi8561.h"
+#include "esp_lcd_panel_interface.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
@@ -16,6 +20,17 @@ static const char *TAG = "esp_lcd_hi8561";
 
 #define HI8561_PANEL_ID        0x8561
 #define HI8561_DCS_PANEL_ID    0x9365
+#define HI8561_CMD_SLPIN       0x10
+#define HI8561_CMD_SLPOUT      0x11
+#define HI8561_CMD_INVOFF      0x20
+#define HI8561_CMD_INVON       0x21
+#define HI8561_CMD_DISPOFF     0x28
+#define HI8561_CMD_DISPON      0x29
+#define HI8561_CMD_MADCTL      0x36
+#define HI8561_CMD_WRDISBV     0x51
+#define HI8561_MADCTL_MY       (1U << 0)
+#define HI8561_MADCTL_MX       (1U << 1)
+#define HI8561_MADCTL_BGR      (1U << 3)
 
 typedef struct {
     uint8_t cmd;
@@ -23,6 +38,26 @@ typedef struct {
     uint8_t data_len;
     uint16_t delay_ms;
 } hi8561_lcd_init_cmd_t;
+
+typedef struct {
+    esp_lcd_panel_t base;
+    esp_lcd_panel_handle_t dpi_panel;
+    esp_lcd_panel_io_handle_t io;
+    uint8_t madctl_val;
+} hi8561_panel_t;
+
+static esp_err_t panel_hi8561_reset(esp_lcd_panel_t *panel);
+static esp_err_t panel_hi8561_init(esp_lcd_panel_t *panel);
+static esp_err_t panel_hi8561_del(esp_lcd_panel_t *panel);
+static esp_err_t panel_hi8561_draw_bitmap(esp_lcd_panel_t *panel, int x_start, int y_start,
+                                          int x_end, int y_end, const void *color_data);
+static esp_err_t panel_hi8561_mirror(esp_lcd_panel_t *panel, bool mirror_x, bool mirror_y);
+static esp_err_t panel_hi8561_swap_xy(esp_lcd_panel_t *panel, bool swap_axes);
+static esp_err_t panel_hi8561_set_gap(esp_lcd_panel_t *panel, int x_gap, int y_gap);
+static esp_err_t panel_hi8561_invert_color(esp_lcd_panel_t *panel, bool invert_color_data);
+static esp_err_t panel_hi8561_disp_on_off(esp_lcd_panel_t *panel, bool on_off);
+static esp_err_t panel_hi8561_disp_sleep(esp_lcd_panel_t *panel, bool sleep);
+static esp_err_t panel_hi8561_set_brightness(esp_lcd_panel_t *panel, int brightness);
 
 static const hi8561_lcd_init_cmd_t s_hi8561_init_cmds[] = {
     {0xdf, (const uint8_t[]){0x90, 0x69, 0xf9}, sizeof((const uint8_t[]){0x90, 0x69, 0xf9}), 0},
@@ -227,19 +262,162 @@ static esp_err_t hi8561_send_init_cmds(esp_lcd_panel_io_handle_t io)
     return ESP_OK;
 }
 
+static esp_err_t hi8561_set_madctl(esp_lcd_panel_io_handle_t io, uint8_t madctl)
+{
+    return esp_lcd_panel_io_tx_param(io, HI8561_CMD_MADCTL, &madctl, sizeof(madctl));
+}
+
+static esp_err_t hi8561_set_brightness(esp_lcd_panel_io_handle_t io, uint8_t brightness)
+{
+    ESP_RETURN_ON_FALSE(io != NULL, ESP_ERR_INVALID_ARG, TAG, "invalid panel io");
+    return esp_lcd_panel_io_tx_param(io, HI8561_CMD_WRDISBV, &brightness, sizeof(brightness));
+}
+
+static esp_err_t panel_hi8561_reset(esp_lcd_panel_t *panel)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    return esp_lcd_panel_reset(hi8561->dpi_panel);
+}
+
+static esp_err_t panel_hi8561_init(esp_lcd_panel_t *panel)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    ESP_RETURN_ON_ERROR(hi8561_check_id(hi8561->io), TAG, "check id failed");
+    ESP_RETURN_ON_ERROR(hi8561_send_init_cmds(hi8561->io), TAG, "send init commands failed");
+    ESP_RETURN_ON_ERROR(hi8561_set_madctl(hi8561->io, hi8561->madctl_val), TAG, "set MADCTL failed");
+    ESP_RETURN_ON_ERROR(panel_hi8561_set_brightness(panel, 0xff),
+                        TAG, "set default brightness failed");
+    return esp_lcd_panel_init(hi8561->dpi_panel);
+}
+
+static esp_err_t panel_hi8561_del(esp_lcd_panel_t *panel)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    esp_err_t ret = esp_lcd_panel_del(hi8561->dpi_panel);
+    free(hi8561);
+    return ret;
+}
+
+static esp_err_t panel_hi8561_draw_bitmap(esp_lcd_panel_t *panel, int x_start, int y_start,
+                                          int x_end, int y_end, const void *color_data)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    return esp_lcd_panel_draw_bitmap(hi8561->dpi_panel, x_start, y_start, x_end, y_end, color_data);
+}
+
+static esp_err_t panel_hi8561_mirror(esp_lcd_panel_t *panel, bool mirror_x, bool mirror_y)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    hi8561->madctl_val &= ~(HI8561_MADCTL_MX | HI8561_MADCTL_MY);
+    if (mirror_x) {
+        hi8561->madctl_val |= HI8561_MADCTL_MX;
+    }
+    if (mirror_y) {
+        hi8561->madctl_val |= HI8561_MADCTL_MY;
+    }
+    return hi8561_set_madctl(hi8561->io, hi8561->madctl_val);
+}
+
+static esp_err_t panel_hi8561_swap_xy(esp_lcd_panel_t *panel, bool swap_axes)
+{
+    return swap_axes ? ESP_ERR_NOT_SUPPORTED : ESP_OK;
+}
+
+static esp_err_t panel_hi8561_set_gap(esp_lcd_panel_t *panel, int x_gap, int y_gap)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    return esp_lcd_panel_set_gap(hi8561->dpi_panel, x_gap, y_gap);
+}
+
+static esp_err_t panel_hi8561_invert_color(esp_lcd_panel_t *panel, bool invert_color_data)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    return esp_lcd_panel_io_tx_param(hi8561->io,
+                                     invert_color_data ? HI8561_CMD_INVON : HI8561_CMD_INVOFF,
+                                     NULL, 0);
+}
+
+static esp_err_t panel_hi8561_disp_on_off(esp_lcd_panel_t *panel, bool on_off)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    return esp_lcd_panel_io_tx_param(hi8561->io,
+                                     on_off ? HI8561_CMD_DISPON : HI8561_CMD_DISPOFF,
+                                     NULL, 0);
+}
+
+static esp_err_t panel_hi8561_disp_sleep(esp_lcd_panel_t *panel, bool sleep)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(hi8561->io,
+                                                  sleep ? HI8561_CMD_SLPIN : HI8561_CMD_SLPOUT,
+                                                  NULL, 0),
+                        TAG, "set sleep mode failed");
+    vTaskDelay(pdMS_TO_TICKS(120));
+    return ESP_OK;
+}
+
+static esp_err_t panel_hi8561_set_brightness(esp_lcd_panel_t *panel, int brightness)
+{
+    hi8561_panel_t *hi8561 = __containerof(panel, hi8561_panel_t, base);
+    ESP_RETURN_ON_FALSE(brightness >= 0 && brightness <= 0xff,
+                        ESP_ERR_INVALID_ARG, TAG, "brightness out of range");
+    return hi8561_set_brightness(hi8561->io, (uint8_t)brightness);
+}
+
 esp_err_t esp_lcd_new_panel_hi8561(const esp_lcd_panel_io_handle_t io,
                                    const esp_lcd_panel_dev_config_t *panel_dev_config,
                                    esp_lcd_panel_handle_t *ret_panel)
 {
+    esp_err_t ret = ESP_OK;
+    hi8561_panel_t *hi8561 = NULL;
+    esp_lcd_panel_handle_t dpi_panel = NULL;
+
     ESP_RETURN_ON_FALSE(io != NULL && panel_dev_config != NULL && ret_panel != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid arguments");
     const hi8561_vendor_config_t *vendor = panel_dev_config->vendor_config;
     ESP_RETURN_ON_FALSE(vendor != NULL && vendor->dsi_bus != NULL && vendor->dpi_config != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid vendor config");
 
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_dpi(vendor->dsi_bus, vendor->dpi_config, ret_panel),
-                        TAG, "create DPI panel failed");
-    ESP_RETURN_ON_ERROR(hi8561_check_id(io), TAG, "check id failed");
-    ESP_RETURN_ON_ERROR(hi8561_send_init_cmds(io), TAG, "send init commands failed");
+    hi8561 = calloc(1, sizeof(hi8561_panel_t));
+    ESP_RETURN_ON_FALSE(hi8561 != NULL, ESP_ERR_NO_MEM, TAG, "no memory for HI8561 panel");
+
+    switch (panel_dev_config->rgb_ele_order) {
+    case LCD_RGB_ELEMENT_ORDER_RGB:
+        hi8561->madctl_val = 0;
+        break;
+    case LCD_RGB_ELEMENT_ORDER_BGR:
+        hi8561->madctl_val = HI8561_MADCTL_BGR;
+        break;
+    default:
+        ret = ESP_ERR_NOT_SUPPORTED;
+        ESP_LOGE(TAG, "unsupported RGB element order");
+        goto err;
+    }
+
+    ESP_GOTO_ON_ERROR(esp_lcd_new_panel_dpi(vendor->dsi_bus, vendor->dpi_config, &dpi_panel),
+                      err, TAG, "create DPI panel failed");
+
+    hi8561->dpi_panel = dpi_panel;
+    hi8561->io = io;
+    hi8561->base.reset = panel_hi8561_reset;
+    hi8561->base.init = panel_hi8561_init;
+    hi8561->base.del = panel_hi8561_del;
+    hi8561->base.draw_bitmap = panel_hi8561_draw_bitmap;
+    hi8561->base.mirror = panel_hi8561_mirror;
+    hi8561->base.swap_xy = panel_hi8561_swap_xy;
+    hi8561->base.set_gap = panel_hi8561_set_gap;
+    hi8561->base.invert_color = panel_hi8561_invert_color;
+    hi8561->base.disp_on_off = panel_hi8561_disp_on_off;
+    hi8561->base.disp_sleep = panel_hi8561_disp_sleep;
+    hi8561->base.set_brightness = panel_hi8561_set_brightness;
+
+    *ret_panel = &hi8561->base;
     return ESP_OK;
+
+err:
+    if (dpi_panel != NULL) {
+        esp_lcd_panel_del(dpi_panel);
+    }
+    free(hi8561);
+    return ret;
 }
